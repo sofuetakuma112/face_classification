@@ -1,0 +1,17 @@
+opencv-python
+face-recognition
+deepface
+pillow
+torch
+torchvision
+transformers
+mediapipe
+brisque
+tf-keras
+mtcnn
+dlib
+numpy
+retinaface-pytorch
+tensorflow
+scikit-learn
+icrawler
