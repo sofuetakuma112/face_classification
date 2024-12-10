@@ -504,6 +504,8 @@ def main():
     try:
         # キャッシュファイルの設定
         cache_file = "embeddings_cache.pkl"
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
 
         input_dir = Path("input")
         output_dir = Path("output")
