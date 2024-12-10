@@ -1,21 +1,3 @@
-"""
-顔画像分類プログラム
-
-このプログラムは、複数の人物の顔画像を入力として受け取り、
-性別を考慮して同じ人物の画像をグループ化して分類します。
-
-主な機能：
-1. 顔の検出と特徴抽出
-2. 性別の判定
-3. 顔画像間の類似度計算
-4. 性別と類似度に基づく画像のグループ化
-
-使用方法：
-1. 分類したい顔画像を「input」ディレクトリに配置
-2. プログラムを実行
-3. 分類結果が「output」ディレクトリに出力される
-"""
-
 from pathlib import Path
 import logging
 import shutil
@@ -75,11 +57,29 @@ def get_embedding_and_gender(
 
         # 日本語ファイル名を英数字に変換
         safe_img_path = safe_path(img_path)
-        if not os.path.exists(safe_img_path):
+        if safe_img_path is None or not os.path.exists(safe_img_path):
             logging.error(f"Safe path not created properly: {safe_img_path}")
             return None
 
         logging.debug(f"Processing image: {img_path}")
+
+        # キャッシュの確認
+        cache_data = {}
+        if os.path.exists(cache_file):
+            with open(cache_file, "rb") as f:
+                try:
+                    cache_data = pickle.load(f)
+                except EOFError:
+                    logging.warning("Empty or corrupt cache file.")
+                    cache_data = {}
+
+        # 絶対パスと相対パスの両方でキャッシュを検索
+        cached_result = cache_data.get(str(img_path.absolute())) or cache_data.get(
+            str(img_path)
+        )
+        if cached_result:
+            logging.debug(f"Using cached result for {img_path}")
+            return cached_result
 
         # Step 1: 顔の検出と特徴抽出
         try:
@@ -153,6 +153,12 @@ def get_embedding_and_gender(
             "gender_confidence": max_score,
         }
 
+        # 結果をキャッシュに保存
+        cache_data[str(img_path.absolute())] = result
+        cache_data[str(img_path)] = result  # 相対パスでもアクセスできるようにする
+        with open(cache_file, "wb") as f:
+            pickle.dump(cache_data, f)
+
         logging.debug(f"Successfully processed {img_path}")
         return result
 
@@ -189,34 +195,28 @@ def calculate_similarity(emb1, emb2):
         return 0.0
 
 
-def process_embeddings(input_images):
+def process_embeddings_parallel(input_images, num_processes):
     """
-    すべての入力画像から特徴ベクトルと性別を抽出する関数
+    マルチプロセスを使用して、すべての入力画像から特徴ベクトルと性別を抽出する関数
     """
+    with Pool(processes=num_processes) as pool:
+        results_list = pool.map(get_embedding_and_gender, input_images)
+
     results = {}
     successful_count = 0
+    for img_path, result in zip(input_images, results_list):
+        if result is not None and "embedding" in result and "gender" in result:
+            # 特徴ベクトルが確実にnumpy配列であることを確認
+            result["embedding"] = np.array(result["embedding"], dtype=float)
 
-    for img_path in input_images:
-        try:
-            # 絶対パスと相対パスを取得
-            abs_path = str(img_path.absolute())
-            rel_path = str(img_path)
+            # 両方のパスでアクセスできるようにする
+            results[str(img_path.absolute())] = result.copy()
+            results[str(img_path)] = result.copy()
 
-            result = get_embedding_and_gender(img_path)
-            if result is not None and "embedding" in result and "gender" in result:
-                # 特徴ベクトルが確実にnumpy配列であることを確認
-                result["embedding"] = np.array(result["embedding"], dtype=float)
-
-                # 両方のパスでアクセスできるようにする
-                results[abs_path] = result.copy()
-                results[rel_path] = result.copy()
-
-                successful_count += 1
-                logging.debug(f"Successfully processed {img_path.name}")
-            else:
-                logging.warning(f"Failed to process {img_path.name}")
-        except Exception as e:
-            logging.error(f"Error processing {img_path.name}: {str(e)}")
+            successful_count += 1
+            logging.debug(f"Successfully processed {img_path.name}")
+        else:
+            logging.warning(f"Failed to process {img_path.name}")
 
     if successful_count == 0:
         logging.error("No embeddings were successfully extracted")
@@ -226,45 +226,61 @@ def process_embeddings(input_images):
     return results
 
 
-def calculate_similarity_matrix(input_images, embeddings_data):
+def get_embedding(img_path, embeddings_data):
     """
-    すべての画像ペア間の類似度を計算する関数
+    指定された画像の埋め込みベクトルを取得する関数
+    """
+    try:
+        abs_path = str(img_path.absolute())
+        rel_path = str(img_path)
+
+        if abs_path in embeddings_data and "embedding" in embeddings_data[abs_path]:
+            return embeddings_data[abs_path]["embedding"]
+        elif rel_path in embeddings_data and "embedding" in embeddings_data[rel_path]:
+            return embeddings_data[rel_path]["embedding"]
+        return None
+    except Exception as e:
+        logging.error(f"Error getting embedding for {img_path}: {str(e)}")
+        return None
+
+
+def calculate_similarity_for_pair(pair, input_images, embeddings_data):
+    """
+    画像ペアの類似度を計算する関数 (トップレベル関数)
+    """
+    i, j = pair
+    try:
+        emb1 = get_embedding(input_images[i], embeddings_data)
+        emb2 = get_embedding(input_images[j], embeddings_data)
+        if emb1 is not None and emb2 is not None:
+            similarity = calculate_similarity(emb1, emb2)
+            return i, j, similarity
+    except Exception as e:
+        logging.error(f"Error calculating similarity for pair ({i}, {j}): {str(e)}")
+    return i, j, 0.0  # エラーが発生した場合は類似度を0.0とする
+
+
+def calculate_similarity_matrix_parallel(input_images, embeddings_data, num_processes):
+    """
+    マルチプロセスを使用して、すべての画像ペア間の類似度を計算する関数
     """
     n = len(input_images)
     similarity_matrix = np.zeros((n, n))
 
-    def get_embedding(img_path):
-        try:
-            abs_path = str(img_path.absolute())
-            rel_path = str(img_path)
-
-            if abs_path in embeddings_data and "embedding" in embeddings_data[abs_path]:
-                return embeddings_data[abs_path]["embedding"]
-            elif (
-                rel_path in embeddings_data and "embedding" in embeddings_data[rel_path]
-            ):
-                return embeddings_data[rel_path]["embedding"]
-            return None
-        except Exception as e:
-            logging.error(f"Error getting embedding for {img_path}: {str(e)}")
-            return None
-
     # 類似度行列の計算
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    with Pool(processes=num_processes) as pool:
+        results = pool.starmap(
+            calculate_similarity_for_pair,
+            [(pair, input_images, embeddings_data) for pair in pairs],
+        )  # starmapに変更
+
+    for i, j, similarity in results:
+        similarity_matrix[i, j] = similarity
+        similarity_matrix[j, i] = similarity
+
     for i in range(n):
         similarity_matrix[i, i] = 1.0  # 自分自身との類似度は1.0
-        for j in range(i + 1, n):
-            try:
-                emb1 = get_embedding(input_images[i])
-                emb2 = get_embedding(input_images[j])
-
-                if emb1 is not None and emb2 is not None:
-                    similarity = calculate_similarity(emb1, emb2)
-                    similarity_matrix[i, j] = similarity
-                    similarity_matrix[j, i] = similarity
-            except Exception as e:
-                logging.error(
-                    f"Error calculating similarity for pair ({i}, {j}): {str(e)}"
-                )
 
     return similarity_matrix
 
@@ -486,11 +502,8 @@ def main():
     メイン処理を行う関数
     """
     try:
-        # キャッシュファイルの削除
+        # キャッシュファイルの設定
         cache_file = "embeddings_cache.pkl"
-        if os.path.exists(cache_file):
-            os.remove(cache_file)
-            logging.info("Removed existing cache file")
 
         input_dir = Path("input")
         output_dir = Path("output")
@@ -510,14 +523,18 @@ def main():
 
         logging.info(f"Processing {len(input_images)} images...")
 
-        # 特徴ベクトルと性別の抽出
-        embeddings_data = process_embeddings(input_images)
+        # 特徴ベクトルと性別の抽出 (並列処理)
+        num_processes = cpu_count()  # 使用可能なCPUコア数を取得
+        embeddings_data = process_embeddings_parallel(input_images, num_processes)
+
         if not embeddings_data:
             logging.error("Failed to extract embeddings from any images")
             return
 
-        # 類似度行列の計算
-        similarity_matrix = calculate_similarity_matrix(input_images, embeddings_data)
+        # 類似度行列の計算 (並列処理)
+        similarity_matrix = calculate_similarity_matrix_parallel(
+            input_images, embeddings_data, num_processes
+        )
 
         # 類似度の統計分析
         stats = analyze_similarities(similarity_matrix)
